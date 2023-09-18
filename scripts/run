@@ -1,0 +1,1 @@
+cmake.exe --build bin && ./bin/Simulator/Debug/Simulator.exe bin/asm/listing_0040_challenge_movs
