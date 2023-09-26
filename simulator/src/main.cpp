@@ -40,5 +40,5 @@ int main(int argc, const char *const *argv) {
   Simulator8086 simulator{fileData};
   simulator.Execute();
 
-  return 1;
+  return 0;
 }

@@ -101,13 +101,18 @@ struct AddressCalculation {
   u8 RegisterCount{};
 };
 
+struct Immediate {
+  u16 Value;
+  u16 ByteCount;
+};
+
 struct Operand {
   OperandType Type{};
   union {
     Register RegisterValue;
     Register RegisterAddress;
     AddressCalculation AddressCalculation;
-    u16 Immediate;
+    Immediate Immediate;
   };
 
   void Print() {
@@ -119,11 +124,12 @@ struct Operand {
       printf("[%s]", GetRegisterName(RegisterValue));
       break;
     case OperandType::Immediate:
-      printf("%u", Immediate);
+      printf("%s %u", Immediate.ByteCount == 2 ? "word" : "byte",
+             Immediate.Value);
       break;
     case OperandType::AddressCalculation: {
       if (AddressCalculation.RegisterCount == 0) {
-        printf("%u", AddressCalculation.Displacement);
+        printf("[%u]", AddressCalculation.Displacement);
       } else {
         printf("[%s", GetRegisterName(AddressCalculation.RegisterA));
         if (AddressCalculation.RegisterCount == 2) {
@@ -157,10 +163,75 @@ u16 SignExtend(u8 byte) {
   return byte;
 }
 
-void MoveToFrom(u8 opcodeByte, SimulatorState &state) {
-  constexpr u8 DirectionMask = 0b0000'0010;
-  constexpr u8 WordMask = 0b0000'0001;
+Operand GetMoveModeOperand(SimulatorState &state, u8 mode, u8 rm, bool word) {
+  Operand operand{};
+  if (Mode(mode) == Mode::Register) {
+    operand.Type = OperandType::RegisterValue;
+    operand.RegisterValue = RegisterFromFlags(rm, word);
+  } else {
+    operand.Type = OperandType::AddressCalculation;
+    operand.AddressCalculation.RegisterCount = 0;
+    operand.AddressCalculation.Displacement = 0;
 
+    if (Mode(mode) == Mode::Memory8BitDisplacement) {
+      operand.AddressCalculation.Displacement =
+          SignExtend(state.AdvanceInstructionByte());
+    } else if (Mode(mode) == Mode::Memory16BitDisplacement ||
+               (Mode(mode) == Mode::NoDisplacement && rm == 0b110)) {
+      operand.AddressCalculation.Displacement = state.AdvanceInstructionWord();
+    }
+
+    switch (rm) {
+    case 0b000:
+      operand.AddressCalculation.RegisterA = Register::BX;
+      operand.AddressCalculation.RegisterB = Register::SI;
+      operand.AddressCalculation.RegisterCount = 2;
+      break;
+    case 0b001:
+      operand.AddressCalculation.RegisterA = Register::BX;
+      operand.AddressCalculation.RegisterB = Register::DI;
+      operand.AddressCalculation.RegisterCount = 2;
+      break;
+    case 0b010:
+      operand.AddressCalculation.RegisterA = Register::BP;
+      operand.AddressCalculation.RegisterB = Register::SI;
+      operand.AddressCalculation.RegisterCount = 2;
+      break;
+    case 0b011:
+      operand.AddressCalculation.RegisterA = Register::BP;
+      operand.AddressCalculation.RegisterB = Register::DI;
+      operand.AddressCalculation.RegisterCount = 2;
+      break;
+    case 0b100:
+      operand.AddressCalculation.RegisterA = Register::SI;
+      operand.AddressCalculation.RegisterCount = 1;
+      break;
+    case 0b101:
+      operand.AddressCalculation.RegisterA = Register::DI;
+      operand.AddressCalculation.RegisterCount = 1;
+      break;
+    case 0b110:
+      if (Mode(mode) != Mode::NoDisplacement) {
+        operand.AddressCalculation.RegisterA = Register::BP;
+        operand.AddressCalculation.RegisterCount = 1;
+      }
+      break;
+    case 0b111:
+      operand.AddressCalculation.RegisterA = Register::BX;
+      operand.AddressCalculation.RegisterCount = 1;
+      break;
+    }
+  }
+
+  return operand;
+}
+
+struct MoveDecode {
+  u8 Mode{};
+  u8 Reg{};
+  u8 RM{};
+};
+MoveDecode GetMoveModeAndRM(u8 data) {
   constexpr u8 ModeMask = 0b1100'0000;
   constexpr u8 ModeShift = 6;
   constexpr u8 RegMask = 0b0011'1000;
@@ -168,78 +239,31 @@ void MoveToFrom(u8 opcodeByte, SimulatorState &state) {
   constexpr u8 RMMask = 0b0000'0111;
   constexpr u8 RMShift = 0;
 
+  MoveDecode result{
+      .Mode = static_cast<u8>((data & ModeMask) >> ModeShift),
+      .Reg = static_cast<u8>((data & RegMask) >> RegShift),
+      .RM = static_cast<u8>((data & RMMask) >> RMShift),
+  };
+
+  return result;
+}
+
+void MoveToFrom(u8 opcodeByte, SimulatorState &state) {
+  constexpr u8 DirectionMask = 0b0000'0010;
+  constexpr u8 WordMask = 0b0000'0001;
+
   u8 byte2 = state.AdvanceInstructionByte();
 
   u8 direction = (opcodeByte & DirectionMask) == DirectionMask;
-  bool word = (opcodeByte & WordMask) == WordMask;
+  MoveDecode decode = GetMoveModeAndRM(byte2);
 
-  u8 mode = (byte2 & ModeMask) >> ModeShift;
-  u8 reg = (byte2 & RegMask) >> RegShift;
-  u8 rm = (byte2 & RMMask) >> RMShift;
+  bool word = (opcodeByte & WordMask) == WordMask;
 
   Operand dest{};
   dest.Type = OperandType::RegisterValue;
-  dest.RegisterValue = RegisterFromFlags(reg, word);
+  dest.RegisterValue = RegisterFromFlags(decode.Reg, word);
 
-  Operand source{};
-  if (Mode(mode) == Mode::Register) {
-    source.Type = OperandType::RegisterValue;
-    source.RegisterValue = RegisterFromFlags(rm, word);
-
-  } else {
-    source.Type = OperandType::AddressCalculation;
-    source.AddressCalculation.RegisterCount = 0;
-    source.AddressCalculation.Displacement = 0;
-
-    if (Mode(mode) == Mode::Memory8BitDisplacement) {
-      source.AddressCalculation.Displacement =
-          SignExtend(state.AdvanceInstructionByte());
-    } else if (Mode(mode) == Mode::Memory16BitDisplacement ||
-               (Mode(mode) == Mode::NoDisplacement && rm == 0b110)) {
-      source.AddressCalculation.Displacement = state.AdvanceInstructionWord();
-    }
-
-    switch (rm) {
-    case 0b000:
-      source.AddressCalculation.RegisterA = Register::BX;
-      source.AddressCalculation.RegisterB = Register::SI;
-      source.AddressCalculation.RegisterCount = 2;
-      break;
-    case 0b001:
-      source.AddressCalculation.RegisterA = Register::BX;
-      source.AddressCalculation.RegisterB = Register::DI;
-      source.AddressCalculation.RegisterCount = 2;
-      break;
-    case 0b010:
-      source.AddressCalculation.RegisterA = Register::BP;
-      source.AddressCalculation.RegisterB = Register::SI;
-      source.AddressCalculation.RegisterCount = 2;
-      break;
-    case 0b011:
-      source.AddressCalculation.RegisterA = Register::BP;
-      source.AddressCalculation.RegisterB = Register::DI;
-      source.AddressCalculation.RegisterCount = 2;
-      break;
-    case 0b100:
-      source.AddressCalculation.RegisterA = Register::SI;
-      source.AddressCalculation.RegisterCount = 1;
-      break;
-    case 0b101:
-      source.AddressCalculation.RegisterA = Register::DI;
-      source.AddressCalculation.RegisterCount = 1;
-      break;
-    case 0b110:
-      if (Mode(mode) != Mode::NoDisplacement) {
-        source.AddressCalculation.RegisterA = Register::BP;
-        source.AddressCalculation.RegisterCount = 1;
-      }
-      break;
-    case 0b111:
-      source.AddressCalculation.RegisterA = Register::BX;
-      source.AddressCalculation.RegisterCount = 1;
-      break;
-    }
-  }
+  Operand source = GetMoveModeOperand(state, decode.Mode, decode.RM, word);
 
   if (direction == 0) {
     std::swap(dest, source);
@@ -258,9 +282,11 @@ void MoveImmediateToRegister(u8 opcodeByte, SimulatorState &state) {
       .Type = OperandType::Immediate,
   };
   if (word) {
-    src.Immediate = state.AdvanceInstructionWord();
+    src.Immediate.ByteCount = 2;
+    src.Immediate.Value = state.AdvanceInstructionWord();
   } else {
-    src.Immediate = state.AdvanceInstructionByte();
+    src.Immediate.ByteCount = 1;
+    src.Immediate.Value = state.AdvanceInstructionByte();
   }
 
   Operand dest{.Type = OperandType::RegisterValue,
@@ -268,11 +294,74 @@ void MoveImmediateToRegister(u8 opcodeByte, SimulatorState &state) {
   PrintInstruction("mov", dest, src);
 }
 
-const OpcodeMatcher OpcodeMatchers[2] = {
+void MoveImmediateBasedOnMode(u8 opcodeByte, SimulatorState &state) {
+  bool word = (opcodeByte & 1) == 1;
+  u8 byte2 = state.AdvanceInstructionByte();
+  MoveDecode decode = GetMoveModeAndRM(byte2);
+
+  Operand destination = GetMoveModeOperand(state, decode.Mode, decode.RM, word);
+
+  Operand source{};
+  source.Type = OperandType::Immediate;
+  if (word) {
+    source.Immediate.ByteCount = 2;
+    source.Immediate.Value = state.AdvanceInstructionWord();
+  } else {
+    source.Immediate.ByteCount = 1;
+    source.Immediate.Value = state.AdvanceInstructionByte();
+  }
+
+  PrintInstruction("mov", destination, source);
+}
+
+void MoveMemoryToFromAccumulator(u8 opcodeByte, SimulatorState &state,
+                                 bool toAccumulator) {
+  bool word = (opcodeByte & 1) == 1;
+
+  Operand dest{
+      .Type = OperandType::RegisterValue,
+      .RegisterValue = RegisterFromFlags(0, word),
+  };
+
+  Operand source{
+      .Type = OperandType::AddressCalculation,
+      .AddressCalculation =
+          {
+              .Displacement = state.AdvanceInstructionWord(),
+              .RegisterCount = 0,
+          },
+  };
+
+  if (!toAccumulator) {
+    std::swap(dest, source);
+  }
+
+  PrintInstruction("mov", dest, source);
+}
+
+void MoveMemoryToAccumulator(u8 opcodeByte, SimulatorState &state) {
+  MoveMemoryToFromAccumulator(opcodeByte, state, true);
+}
+
+void MoveAccumlatorToMemory(u8 opcodeByte, SimulatorState &state) {
+  MoveMemoryToFromAccumulator(opcodeByte, state, false);
+}
+
+const OpcodeMatcher OpcodeMatchers[] = {
     {.Mask = 0b1111'1100, .Opcode = 0b1000'1000, .Func = MoveToFrom},
     {.Mask = 0b1111'0000,
      .Opcode = 0b1011'0000,
      .Func = MoveImmediateToRegister},
+    {.Mask = 0b1111'1110,
+     .Opcode = 0b1100'0110,
+     .Func = MoveImmediateBasedOnMode},
+    {.Mask = 0b1111'1110,
+     .Opcode = 0b1010'0000,
+     .Func = MoveMemoryToAccumulator},
+    {.Mask = 0b1111'1110,
+     .Opcode = 0b1010'0010,
+     .Func = MoveAccumlatorToMemory},
+
 };
 
 bool FindOperation(u8 opcodeByte, OpcodeMatcher *output) {
