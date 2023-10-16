@@ -6,6 +6,7 @@
 namespace {
 
 typedef void (*OperationExecutor)(u8 opcodeByte, SimulatorState &state);
+
 struct OpcodeMatcher {
   u8 Mask{};
   u8 Opcode{};
@@ -38,6 +39,13 @@ enum class Register {
   SI = 0b1110,
   DI = 0b1111,
   MAX = DI
+};
+
+struct FlagMasks {
+  u8 Word{};
+  u8 SignExtend{};
+
+  bool IsWord(u8 opcodeByte) { return (opcodeByte & Word) > 0; }
 };
 
 Register RegisterFromFlags(u8 reg, bool wide) {
@@ -226,6 +234,26 @@ Operand GetMoveModeOperand(SimulatorState &state, u8 mode, u8 rm, bool word) {
   return operand;
 }
 
+Operand DecodeImmediate(SimulatorState &state, u8 opcodeByte, FlagMasks masks) {
+  bool word = masks.IsWord(opcodeByte);
+  bool signExtend = (opcodeByte & masks.SignExtend) > 0;
+
+  Operand operand{};
+  operand.Type = OperandType::Immediate;
+  if (word && signExtend) {
+    operand.Immediate.ByteCount = 1;
+    operand.Immediate.Value = SignExtend(state.AdvanceInstructionByte());
+  } else if (word) {
+    operand.Immediate.ByteCount = 2;
+    operand.Immediate.Value = state.AdvanceInstructionWord();
+  } else {
+    operand.Immediate.ByteCount = 1;
+    operand.Immediate.Value = state.AdvanceInstructionByte();
+  }
+
+  return operand;
+}
+
 struct MoveDecode {
   u8 Mode{};
   u8 Reg{};
@@ -248,7 +276,8 @@ MoveDecode GetMoveModeAndRM(u8 data) {
   return result;
 }
 
-void MoveToFrom(u8 opcodeByte, SimulatorState &state) {
+void OperationToFrom(const char *mneumonic, u8 opcodeByte,
+                     SimulatorState &state) {
   constexpr u8 DirectionMask = 0b0000'0010;
   constexpr u8 WordMask = 0b0000'0001;
 
@@ -269,53 +298,50 @@ void MoveToFrom(u8 opcodeByte, SimulatorState &state) {
     std::swap(dest, source);
   }
 
-  PrintInstruction("mov", dest, source);
+  PrintInstruction(mneumonic, dest, source);
+}
+
+void MoveToFrom(u8 opcodeByte, SimulatorState &state) {
+  OperationToFrom("mov", opcodeByte, state);
+}
+
+void OperationImmediateToRegister(const char *mneumonic, u8 opcodeByte,
+                                  SimulatorState &state, FlagMasks masks) {
+  constexpr u8 RegMask = 0b0000'0111;
+  bool word = (opcodeByte & masks.Word) > 0;
+  u8 reg = (opcodeByte & RegMask);
+
+  Operand src = DecodeImmediate(state, opcodeByte, masks);
+  Operand dest{.Type = OperandType::RegisterValue,
+               .RegisterValue = RegisterFromFlags(reg, word)};
+
+  PrintInstruction(mneumonic, dest, src);
 }
 
 void MoveImmediateToRegister(u8 opcodeByte, SimulatorState &state) {
-  constexpr u8 WordMask = 0b0000'1000;
-  constexpr u8 RegMask = 0b0000'0111;
-  bool word = (opcodeByte & WordMask) == WordMask;
-  u8 reg = (opcodeByte & RegMask);
-
-  Operand src{
-      .Type = OperandType::Immediate,
-  };
-  if (word) {
-    src.Immediate.ByteCount = 2;
-    src.Immediate.Value = state.AdvanceInstructionWord();
-  } else {
-    src.Immediate.ByteCount = 1;
-    src.Immediate.Value = state.AdvanceInstructionByte();
-  }
-
-  Operand dest{.Type = OperandType::RegisterValue,
-               .RegisterValue = RegisterFromFlags(reg, word)};
-  PrintInstruction("mov", dest, src);
+  FlagMasks masks{.Word = 1};
+  OperationImmediateToRegister("mov", opcodeByte, state, masks);
 }
 
-void MoveImmediateBasedOnMode(u8 opcodeByte, SimulatorState &state) {
-  bool word = (opcodeByte & 1) == 1;
+void OperationBasedOnMode(const char *mneumonic, u8 opcodeByte,
+                          SimulatorState &state, struct FlagMasks masks) {
+  bool word = (opcodeByte & masks.Word) > 0;
   u8 byte2 = state.AdvanceInstructionByte();
   MoveDecode decode = GetMoveModeAndRM(byte2);
 
   Operand destination = GetMoveModeOperand(state, decode.Mode, decode.RM, word);
-
-  Operand source{};
-  source.Type = OperandType::Immediate;
-  if (word) {
-    source.Immediate.ByteCount = 2;
-    source.Immediate.Value = state.AdvanceInstructionWord();
-  } else {
-    source.Immediate.ByteCount = 1;
-    source.Immediate.Value = state.AdvanceInstructionByte();
-  }
-
-  PrintInstruction("mov", destination, source);
+  Operand source = DecodeImmediate(state, opcodeByte, masks);
+  PrintInstruction(mneumonic, destination, source);
 }
 
-void MoveMemoryToFromAccumulator(u8 opcodeByte, SimulatorState &state,
-                                 bool toAccumulator) {
+void MoveBasedOnMode(u8 opcodeByte, SimulatorState &state) {
+  FlagMasks masks{.Word = 1};
+  OperationBasedOnMode("mov", opcodeByte, state, masks);
+}
+
+void OperationMemoryToFromAccumulator(const char *mneumonic, u8 opcodeByte,
+                                      SimulatorState &state,
+                                      bool toAccumulator) {
   bool word = (opcodeByte & 1) == 1;
 
   Operand dest{
@@ -336,15 +362,36 @@ void MoveMemoryToFromAccumulator(u8 opcodeByte, SimulatorState &state,
     std::swap(dest, source);
   }
 
-  PrintInstruction("mov", dest, source);
+  PrintInstruction(mneumonic, dest, source);
 }
 
 void MoveMemoryToAccumulator(u8 opcodeByte, SimulatorState &state) {
-  MoveMemoryToFromAccumulator(opcodeByte, state, true);
+  OperationMemoryToFromAccumulator("mov", opcodeByte, state, true);
 }
 
 void MoveAccumlatorToMemory(u8 opcodeByte, SimulatorState &state) {
-  MoveMemoryToFromAccumulator(opcodeByte, state, false);
+  OperationMemoryToFromAccumulator("mov", opcodeByte, state, false);
+}
+
+void AddToFrom(u8 opcodeByte, SimulatorState &state) {
+  OperationToFrom("add", opcodeByte, state);
+}
+
+void AddBasedOnMode(u8 opcodeByte, SimulatorState &state) {
+  FlagMasks masks{.Word = 1, .SignExtend = 2};
+  OperationBasedOnMode("add", opcodeByte, state, masks);
+}
+
+void AddImmediate(u8 opcodeByte, SimulatorState &state) {
+  FlagMasks masks{.Word = 1};
+
+  Operand dest{};
+  dest.Type = OperandType::RegisterValue;
+  dest.RegisterValue = masks.IsWord(opcodeByte) ? Register::AX : Register::AL;
+
+  Operand source = DecodeImmediate(state, opcodeByte, masks);
+
+  PrintInstruction("add", dest, source);
 }
 
 const OpcodeMatcher OpcodeMatchers[] = {
@@ -352,9 +399,7 @@ const OpcodeMatcher OpcodeMatchers[] = {
     {.Mask = 0b1111'0000,
      .Opcode = 0b1011'0000,
      .Func = MoveImmediateToRegister},
-    {.Mask = 0b1111'1110,
-     .Opcode = 0b1100'0110,
-     .Func = MoveImmediateBasedOnMode},
+    {.Mask = 0b1111'1110, .Opcode = 0b1100'0110, .Func = MoveBasedOnMode},
     {.Mask = 0b1111'1110,
      .Opcode = 0b1010'0000,
      .Func = MoveMemoryToAccumulator},
@@ -362,6 +407,14 @@ const OpcodeMatcher OpcodeMatchers[] = {
      .Opcode = 0b1010'0010,
      .Func = MoveAccumlatorToMemory},
 
+    {.Mask = 0b1111'1100, .Opcode = 0b0000'0000, .Func = AddToFrom},
+    {.Mask = 0b1111'1100, .Opcode = 0b1000'0000, .Func = AddBasedOnMode},
+    {.Mask = 0b1111'1110, .Opcode = 0b0000'0100, .Func = AddImmediate},
+
+    // TODO subtraction ops
+    // {.Mask = 0b1111'1100, .Opcode = 0b0010'1000, .Func = AddToFrom},
+    // {.Mask = 0b1111'1100, .Opcode = 0b1000'0000, .Func = AddBasedOnMode},
+    // {.Mask = 0b1111'1110, .Opcode = 0b0010'1100, .Func = AddImmediate},
 };
 
 bool FindOperation(u8 opcodeByte, OpcodeMatcher *output) {

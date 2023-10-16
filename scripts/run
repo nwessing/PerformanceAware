@@ -1,1 +1,3 @@
-cmake.exe --build bin && ./bin/Simulator/Debug/Simulator.exe bin/asm/listing_0040_challenge_movs
+LISTING=listing_0041_add_sub_cmp_jnz
+#LISTING=listing_0039_more_movs
+cmake.exe --build bin && ./bin/Simulator/Debug/Simulator.exe bin/asm/$LISTING

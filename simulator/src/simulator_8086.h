@@ -1,5 +1,6 @@
 #pragma once
 #include <cassert>
+#include <cstdio>
 #include <span>
 #include <stdint.h>
 
@@ -24,6 +25,9 @@ struct SimulatorState {
   u8 ReadByte(u32 address) {
     assert(address < CodeLength);
 
+#ifdef DEBUG_INSTRUCTIONS
+    printf("D %x\n", Code[address]);
+#endif
     return Code[address];
   }
 
@@ -32,6 +36,10 @@ struct SimulatorState {
     u16 lower = Code[address + 0];
     u16 upper = Code[address + 1];
 
+#ifdef DEBUG_INSTRUCTIONS
+    printf("D %x\n", Code[address]);
+    printf("D %x\n", Code[address + 1]);
+#endif
     return lower | (upper << 8);
   }
 };
