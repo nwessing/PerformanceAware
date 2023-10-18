@@ -1,17 +1,96 @@
 #include "simulator_8086.h"
+#include <array>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
 
 namespace {
+struct InstructionVariables {
+  bool Word{};
+  bool SignExtend{};
+  bool Direction{};
+  u8 Reg{};
+  u8 Mode{};
+  u8 RM{};
+};
 
-typedef void (*OperationExecutor)(u8 opcodeByte, SimulatorState &state);
+typedef void (*OperationExecutor)(InstructionVariables variables,
+                                  SimulatorState &state);
+
+constexpr u16 InstructionVariableUnused = 16;
+struct InstructionVariableOffsets {
+  u16 Word{InstructionVariableUnused};
+  u16 SignExtend{InstructionVariableUnused};
+  u16 Direction{InstructionVariableUnused};
+  u16 Reg{InstructionVariableUnused};
+  u16 Mode{InstructionVariableUnused};
+  u16 RM{InstructionVariableUnused};
+};
+
+enum class OpcodePartType { Constant, Variable };
+
+struct OpcodePart {
+  OpcodePartType Type{};
+  u8 BitLength{};
+  u8 ConstantPattern{};
+};
 
 struct OpcodeMatcher {
-  u8 Mask{};
-  u8 Opcode{};
+  std::array<OpcodePart, 5> Parts{};
   OperationExecutor Func{};
+  InstructionVariableOffsets VariableOffsets{};
+  u8 BitLength{};
+
+  OpcodeMatcher(OperationExecutor func,
+                InstructionVariableOffsets variableOffsets,
+                std::initializer_list<OpcodePart> parts)
+      : VariableOffsets(variableOffsets), Func(func) {
+
+    assert(parts.size() <= 5);
+
+    u32 partIndex = 0;
+    for (const OpcodePart &part : parts) {
+      Parts[partIndex] = part;
+      BitLength += part.BitLength;
+      ++partIndex;
+    }
+  }
+
+  bool Matches(u16 opcode, u8 byteCount) const {
+    if (BitLength > byteCount * 8) {
+      return false;
+    }
+
+    u8 bitIndex = 0;
+    for (const auto &part : Parts) {
+      if (part.Type == OpcodePartType::Constant) {
+        u16 pattern = u16(part.ConstantPattern);
+        u16 mask = (u32(1u << part.BitLength) - 1u);
+        if ((mask & (opcode >> (16u - bitIndex - part.BitLength))) != pattern) {
+          return false;
+        }
+      }
+
+      bitIndex += part.BitLength;
+      if (bitIndex >= BitLength) {
+        break;
+      }
+    }
+
+    return true;
+  }
 };
+
+OpcodePart ConstantPart(u8 bitLength, u8 pattern) {
+  OpcodePart part{.Type = OpcodePartType::Constant,
+                  .BitLength = bitLength,
+                  .ConstantPattern = pattern};
+  return part;
+}
+OpcodePart VariablePart(u8 bitLength) {
+  OpcodePart part{.Type = OpcodePartType::Variable, .BitLength = bitLength};
+  return part;
+}
 
 enum class Mode : u8 {
   NoDisplacement = 0b00,
@@ -46,10 +125,12 @@ struct FlagMasks {
   u8 SignExtend{};
 
   bool IsWord(u8 opcodeByte) { return (opcodeByte & Word) > 0; }
+
+  bool IsSignExtension(u8 opcodeByte) { return (opcodeByte & SignExtend) > 0; }
 };
 
-Register RegisterFromFlags(u8 reg, bool wide) {
-  u8 code = (wide << 3) | reg;
+Register RegisterFromFlags(u8 reg, bool word) {
+  u8 code = (word << 3) | reg;
   assert(Register(code) <= Register::MAX);
   return Register(code);
 }
@@ -234,16 +315,13 @@ Operand GetMoveModeOperand(SimulatorState &state, u8 mode, u8 rm, bool word) {
   return operand;
 }
 
-Operand DecodeImmediate(SimulatorState &state, u8 opcodeByte, FlagMasks masks) {
-  bool word = masks.IsWord(opcodeByte);
-  bool signExtend = (opcodeByte & masks.SignExtend) > 0;
-
+Operand DecodeImmediate(SimulatorState &state, InstructionVariables variables) {
   Operand operand{};
   operand.Type = OperandType::Immediate;
-  if (word && signExtend) {
+  if (variables.Word && variables.SignExtend) {
     operand.Immediate.ByteCount = 1;
     operand.Immediate.Value = SignExtend(state.AdvanceInstructionByte());
-  } else if (word) {
+  } else if (variables.Word) {
     operand.Immediate.ByteCount = 2;
     operand.Immediate.Value = state.AdvanceInstructionWord();
   } else {
@@ -254,99 +332,63 @@ Operand DecodeImmediate(SimulatorState &state, u8 opcodeByte, FlagMasks masks) {
   return operand;
 }
 
-struct MoveDecode {
-  u8 Mode{};
-  u8 Reg{};
-  u8 RM{};
-};
-MoveDecode GetMoveModeAndRM(u8 data) {
-  constexpr u8 ModeMask = 0b1100'0000;
-  constexpr u8 ModeShift = 6;
-  constexpr u8 RegMask = 0b0011'1000;
-  constexpr u8 RegShift = 3;
-  constexpr u8 RMMask = 0b0000'0111;
-  constexpr u8 RMShift = 0;
-
-  MoveDecode result{
-      .Mode = static_cast<u8>((data & ModeMask) >> ModeShift),
-      .Reg = static_cast<u8>((data & RegMask) >> RegShift),
-      .RM = static_cast<u8>((data & RMMask) >> RMShift),
-  };
-
-  return result;
-}
-
-void OperationToFrom(const char *mneumonic, u8 opcodeByte,
+void OperationToFrom(const char *mneumonic, InstructionVariables variables,
                      SimulatorState &state) {
-  constexpr u8 DirectionMask = 0b0000'0010;
-  constexpr u8 WordMask = 0b0000'0001;
-
-  u8 byte2 = state.AdvanceInstructionByte();
-
-  u8 direction = (opcodeByte & DirectionMask) == DirectionMask;
-  MoveDecode decode = GetMoveModeAndRM(byte2);
-
-  bool word = (opcodeByte & WordMask) == WordMask;
-
   Operand dest{};
   dest.Type = OperandType::RegisterValue;
-  dest.RegisterValue = RegisterFromFlags(decode.Reg, word);
+  dest.RegisterValue = RegisterFromFlags(variables.Reg, variables.Word);
 
-  Operand source = GetMoveModeOperand(state, decode.Mode, decode.RM, word);
+  Operand source =
+      GetMoveModeOperand(state, variables.Mode, variables.RM, variables.Word);
 
-  if (direction == 0) {
+  if (!variables.Direction) {
     std::swap(dest, source);
   }
 
   PrintInstruction(mneumonic, dest, source);
 }
 
-void MoveToFrom(u8 opcodeByte, SimulatorState &state) {
-  OperationToFrom("mov", opcodeByte, state);
+void MoveToFrom(InstructionVariables variables, SimulatorState &state) {
+  OperationToFrom("mov", variables, state);
 }
 
-void OperationImmediateToRegister(const char *mneumonic, u8 opcodeByte,
-                                  SimulatorState &state, FlagMasks masks) {
-  constexpr u8 RegMask = 0b0000'0111;
-  bool word = (opcodeByte & masks.Word) > 0;
-  u8 reg = (opcodeByte & RegMask);
+void OperationImmediateToRegister(const char *mneumonic,
+                                  InstructionVariables variables,
+                                  SimulatorState &state) {
 
-  Operand src = DecodeImmediate(state, opcodeByte, masks);
+  Operand src = DecodeImmediate(state, variables);
   Operand dest{.Type = OperandType::RegisterValue,
-               .RegisterValue = RegisterFromFlags(reg, word)};
+               .RegisterValue =
+                   RegisterFromFlags(variables.Reg, variables.Word)};
 
   PrintInstruction(mneumonic, dest, src);
 }
 
-void MoveImmediateToRegister(u8 opcodeByte, SimulatorState &state) {
-  FlagMasks masks{.Word = 1};
-  OperationImmediateToRegister("mov", opcodeByte, state, masks);
+void MoveImmediateToRegister(InstructionVariables variables,
+                             SimulatorState &state) {
+  OperationImmediateToRegister("mov", variables, state);
 }
 
-void OperationBasedOnMode(const char *mneumonic, u8 opcodeByte,
-                          SimulatorState &state, struct FlagMasks masks) {
-  bool word = (opcodeByte & masks.Word) > 0;
-  u8 byte2 = state.AdvanceInstructionByte();
-  MoveDecode decode = GetMoveModeAndRM(byte2);
-
-  Operand destination = GetMoveModeOperand(state, decode.Mode, decode.RM, word);
-  Operand source = DecodeImmediate(state, opcodeByte, masks);
+void OperationBasedOnMode(const char *mneumonic, InstructionVariables variables,
+                          SimulatorState &state) {
+  Operand destination =
+      GetMoveModeOperand(state, variables.Mode, variables.RM, variables.Word);
+  Operand source = DecodeImmediate(state, variables);
   PrintInstruction(mneumonic, destination, source);
 }
 
-void MoveBasedOnMode(u8 opcodeByte, SimulatorState &state) {
-  FlagMasks masks{.Word = 1};
-  OperationBasedOnMode("mov", opcodeByte, state, masks);
+void MoveImmediateToRegisterOrMemory(InstructionVariables InstructionVariables,
+                                     SimulatorState &state) {
+  OperationBasedOnMode("mov", InstructionVariables, state);
 }
 
-void OperationMemoryToFromAccumulator(const char *mneumonic, u8 opcodeByte,
+void OperationMemoryToFromAccumulator(const char *mneumonic,
+                                      InstructionVariables variables,
                                       SimulatorState &state,
                                       bool toAccumulator) {
-  bool word = (opcodeByte & 1) == 1;
-
   Operand dest{
       .Type = OperandType::RegisterValue,
-      .RegisterValue = RegisterFromFlags(0, word),
+      .RegisterValue = RegisterFromFlags(0, variables.Word),
   };
 
   Operand source{
@@ -365,67 +407,97 @@ void OperationMemoryToFromAccumulator(const char *mneumonic, u8 opcodeByte,
   PrintInstruction(mneumonic, dest, source);
 }
 
-void MoveMemoryToAccumulator(u8 opcodeByte, SimulatorState &state) {
-  OperationMemoryToFromAccumulator("mov", opcodeByte, state, true);
+void MoveMemoryToAccumulator(InstructionVariables variables,
+                             SimulatorState &state) {
+  OperationMemoryToFromAccumulator("mov", variables, state, true);
 }
 
-void MoveAccumlatorToMemory(u8 opcodeByte, SimulatorState &state) {
-  OperationMemoryToFromAccumulator("mov", opcodeByte, state, false);
+void MoveAccumlatorToMemory(InstructionVariables variables,
+                            SimulatorState &state) {
+  OperationMemoryToFromAccumulator("mov", variables, state, false);
 }
 
-void AddToFrom(u8 opcodeByte, SimulatorState &state) {
-  OperationToFrom("add", opcodeByte, state);
+void AddToFrom(InstructionVariables variables, SimulatorState &state) {
+  OperationToFrom("add", variables, state);
 }
 
-void AddBasedOnMode(u8 opcodeByte, SimulatorState &state) {
-  FlagMasks masks{.Word = 1, .SignExtend = 2};
-  OperationBasedOnMode("add", opcodeByte, state, masks);
+void AddBasedOnMode(InstructionVariables variables, SimulatorState &state) {
+  OperationBasedOnMode("add", variables, state);
 }
 
-void AddImmediate(u8 opcodeByte, SimulatorState &state) {
-  FlagMasks masks{.Word = 1};
+void AddImmediate(InstructionVariables variables, SimulatorState &state) {
 
   Operand dest{};
   dest.Type = OperandType::RegisterValue;
-  dest.RegisterValue = masks.IsWord(opcodeByte) ? Register::AX : Register::AL;
+  dest.RegisterValue = variables.Word ? Register::AX : Register::AL;
 
-  Operand source = DecodeImmediate(state, opcodeByte, masks);
+  Operand source = DecodeImmediate(state, variables);
 
   PrintInstruction("add", dest, source);
 }
 
-const OpcodeMatcher OpcodeMatchers[] = {
-    {.Mask = 0b1111'1100, .Opcode = 0b1000'1000, .Func = MoveToFrom},
-    {.Mask = 0b1111'0000,
-     .Opcode = 0b1011'0000,
-     .Func = MoveImmediateToRegister},
-    {.Mask = 0b1111'1110, .Opcode = 0b1100'0110, .Func = MoveBasedOnMode},
-    {.Mask = 0b1111'1110,
-     .Opcode = 0b1010'0000,
-     .Func = MoveMemoryToAccumulator},
-    {.Mask = 0b1111'1110,
-     .Opcode = 0b1010'0010,
-     .Func = MoveAccumlatorToMemory},
+constexpr InstructionVariableOffsets RegisterOrMemoryToRegisterOrMemoryOffsets =
+    {.Word = 8, .Direction = 9, .Reg = 3, .Mode = 6, .RM = 0};
+constexpr InstructionVariableOffsets ImmediateToRegisterOrMemoryOffsets = {
+    .Word = 8, .Mode = 6, .RM = 0};
+constexpr InstructionVariableOffsets
+    ImmediateToRegisterOrMemoryArithmeticOffsets = {
+        .Word = 8, .SignExtend = 9, .Mode = 6, .RM = 0};
 
-    {.Mask = 0b1111'1100, .Opcode = 0b0000'0000, .Func = AddToFrom},
-    {.Mask = 0b1111'1100, .Opcode = 0b1000'0000, .Func = AddBasedOnMode},
-    {.Mask = 0b1111'1110, .Opcode = 0b0000'0100, .Func = AddImmediate},
+constexpr InstructionVariableOffsets WordOnlyOffsets = {.Word = 8};
+constexpr InstructionVariableOffsets ImmediateToRegisterOffsets = {.Word = 11,
+                                                                   .Reg = 8};
+
+const OpcodeMatcher OpcodeMatchers[] = {
+    OpcodeMatcher(MoveToFrom, RegisterOrMemoryToRegisterOrMemoryOffsets,
+                  {ConstantPart(6, 0b100010), VariablePart(10)}),
+    OpcodeMatcher(MoveImmediateToRegister, ImmediateToRegisterOffsets,
+                  {ConstantPart(4, 0b1011), VariablePart(4)}),
+    OpcodeMatcher(MoveImmediateToRegisterOrMemory,
+                  ImmediateToRegisterOrMemoryOffsets,
+                  {ConstantPart(7, 0b1100011), VariablePart(3),
+                   ConstantPart(3, 0b000), VariablePart(3)}),
+    OpcodeMatcher(MoveMemoryToAccumulator, WordOnlyOffsets,
+                  {ConstantPart(7, 0b1010000), VariablePart(1)}),
+    OpcodeMatcher(MoveAccumlatorToMemory, WordOnlyOffsets,
+                  {ConstantPart(7, 0b1010001), VariablePart(1)}),
+
+    OpcodeMatcher(AddToFrom, RegisterOrMemoryToRegisterOrMemoryOffsets,
+                  {ConstantPart(6, 0b000000), VariablePart(10)}),
+    OpcodeMatcher(AddBasedOnMode, ImmediateToRegisterOrMemoryArithmeticOffsets,
+                  {ConstantPart(6, 0b100000), VariablePart(4),
+                   ConstantPart(3, 0b000), VariablePart(3)}),
+    OpcodeMatcher(AddImmediate, WordOnlyOffsets,
+                  {ConstantPart(7, 0b0000010), VariablePart(1)}),
 
     // TODO subtraction ops
     // {.Mask = 0b1111'1100, .Opcode = 0b0010'1000, .Func = AddToFrom},
     // {.Mask = 0b1111'1100, .Opcode = 0b1000'0000, .Func = AddBasedOnMode},
     // {.Mask = 0b1111'1110, .Opcode = 0b0010'1100, .Func = AddImmediate},
-};
+}; // namespace
 
-bool FindOperation(u8 opcodeByte, OpcodeMatcher *output) {
+bool FindOperation(u16 opcode, u8 byteLength, const OpcodeMatcher **output) {
   for (const auto &matcher : OpcodeMatchers) {
-    if ((opcodeByte & matcher.Mask) == matcher.Opcode) {
-      *output = matcher;
+    if (matcher.Matches(opcode, byteLength)) {
+      *output = &matcher;
       return true;
     }
   }
 
   return false;
+}
+
+InstructionVariables
+ExtractInstructionVariables(const InstructionVariableOffsets &offsets,
+                            u16 opcode) {
+  InstructionVariables result{};
+  result.Word = ((opcode >> offsets.Word) & 0b1) == 1;
+  result.Direction = ((opcode >> offsets.Direction) & 0b1) == 1;
+  result.SignExtend = ((opcode >> offsets.SignExtend) & 0b1) == 1;
+  result.RM = (opcode >> offsets.RM) & 0b111;
+  result.Mode = (opcode >> offsets.Mode) & 0b11;
+  result.Reg = (opcode >> offsets.Reg) & 0b111;
+  return result;
 }
 
 } // namespace
@@ -437,14 +509,23 @@ void Simulator8086::Execute() {
     }
 
     u8 opcodeByte = mState.AdvanceInstructionByte();
+    u8 readLength = mState.PC < mState.CodeLength ? 2 : 1;
+    u8 nextOpcodeByte = readLength == 2 ? mState.ReadByte(mState.PC) : 0;
+    u16 opcode = (u16(opcodeByte) << 8) | nextOpcodeByte;
 
-    OpcodeMatcher opcode{};
-    if (!FindOperation(opcodeByte, &opcode)) {
+    const OpcodeMatcher *opcodeMatcher{};
+    if (!FindOperation(opcode, readLength, &opcodeMatcher)) {
       printf("ERROR Unexpected opcode pattern %hhx\n", opcodeByte);
       return;
     }
 
-    opcode.Func(opcodeByte, mState);
+    if (opcodeMatcher->BitLength > 8) {
+      mState.AdvanceInstructionByte();
+    }
+
+    InstructionVariables variables =
+        ExtractInstructionVariables(opcodeMatcher->VariableOffsets, opcode);
+    opcodeMatcher->Func(variables, mState);
     if (mState.Error) {
       printf("ERROR Unexpected opcode pattern %hhx\n", opcodeByte);
       return;
