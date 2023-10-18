@@ -319,7 +319,7 @@ Operand DecodeImmediate(SimulatorState &state, InstructionVariables variables) {
   Operand operand{};
   operand.Type = OperandType::Immediate;
   if (variables.Word && variables.SignExtend) {
-    operand.Immediate.ByteCount = 1;
+    operand.Immediate.ByteCount = 2;
     operand.Immediate.Value = SignExtend(state.AdvanceInstructionByte());
   } else if (variables.Word) {
     operand.Immediate.ByteCount = 2;
@@ -417,15 +417,28 @@ void MoveAccumlatorToMemory(InstructionVariables variables,
   OperationMemoryToFromAccumulator("mov", variables, state, false);
 }
 
-void AddToFrom(InstructionVariables variables, SimulatorState &state) {
+void AddRegisterOrMemoryAndRegisterToEither(InstructionVariables variables,
+                                            SimulatorState &state) {
   OperationToFrom("add", variables, state);
 }
 
-void AddBasedOnMode(InstructionVariables variables, SimulatorState &state) {
+void SubtractRegisterOrMemoryAndRegisterToEither(InstructionVariables variables,
+                                                 SimulatorState &state) {
+  OperationToFrom("sub", variables, state);
+}
+
+void AddImmediateFromRegisterOrMemory(InstructionVariables variables,
+                                      SimulatorState &state) {
   OperationBasedOnMode("add", variables, state);
 }
 
-void AddImmediate(InstructionVariables variables, SimulatorState &state) {
+void SubtractImmediateFromRegisterOrMemory(InstructionVariables variables,
+                                           SimulatorState &state) {
+  OperationBasedOnMode("sub", variables, state);
+}
+
+void OperationImmediate(const char *mneumonic, InstructionVariables variables,
+                        SimulatorState &state) {
 
   Operand dest{};
   dest.Type = OperandType::RegisterValue;
@@ -433,7 +446,15 @@ void AddImmediate(InstructionVariables variables, SimulatorState &state) {
 
   Operand source = DecodeImmediate(state, variables);
 
-  PrintInstruction("add", dest, source);
+  PrintInstruction(mneumonic, dest, source);
+}
+
+void AddImmediate(InstructionVariables variables, SimulatorState &state) {
+  OperationImmediate("add", variables, state);
+}
+
+void SubtractImmediate(InstructionVariables variables, SimulatorState &state) {
+  OperationImmediate("sub", variables, state);
 }
 
 constexpr InstructionVariableOffsets RegisterOrMemoryToRegisterOrMemoryOffsets =
@@ -449,6 +470,7 @@ constexpr InstructionVariableOffsets ImmediateToRegisterOffsets = {.Word = 11,
                                                                    .Reg = 8};
 
 const OpcodeMatcher OpcodeMatchers[] = {
+    // Move
     OpcodeMatcher(MoveToFrom, RegisterOrMemoryToRegisterOrMemoryOffsets,
                   {ConstantPart(6, 0b100010), VariablePart(10)}),
     OpcodeMatcher(MoveImmediateToRegister, ImmediateToRegisterOffsets,
@@ -462,18 +484,28 @@ const OpcodeMatcher OpcodeMatchers[] = {
     OpcodeMatcher(MoveAccumlatorToMemory, WordOnlyOffsets,
                   {ConstantPart(7, 0b1010001), VariablePart(1)}),
 
-    OpcodeMatcher(AddToFrom, RegisterOrMemoryToRegisterOrMemoryOffsets,
+    // Add
+    OpcodeMatcher(AddRegisterOrMemoryAndRegisterToEither,
+                  RegisterOrMemoryToRegisterOrMemoryOffsets,
                   {ConstantPart(6, 0b000000), VariablePart(10)}),
-    OpcodeMatcher(AddBasedOnMode, ImmediateToRegisterOrMemoryArithmeticOffsets,
+    OpcodeMatcher(AddImmediateFromRegisterOrMemory,
+                  ImmediateToRegisterOrMemoryArithmeticOffsets,
                   {ConstantPart(6, 0b100000), VariablePart(4),
                    ConstantPart(3, 0b000), VariablePart(3)}),
     OpcodeMatcher(AddImmediate, WordOnlyOffsets,
                   {ConstantPart(7, 0b0000010), VariablePart(1)}),
 
-    // TODO subtraction ops
-    // {.Mask = 0b1111'1100, .Opcode = 0b0010'1000, .Func = AddToFrom},
-    // {.Mask = 0b1111'1100, .Opcode = 0b1000'0000, .Func = AddBasedOnMode},
-    // {.Mask = 0b1111'1110, .Opcode = 0b0010'1100, .Func = AddImmediate},
+    // Subtract
+    OpcodeMatcher(SubtractRegisterOrMemoryAndRegisterToEither,
+                  RegisterOrMemoryToRegisterOrMemoryOffsets,
+                  {ConstantPart(6, 0b001010), VariablePart(10)}),
+    OpcodeMatcher(SubtractImmediateFromRegisterOrMemory,
+                  ImmediateToRegisterOrMemoryArithmeticOffsets,
+                  {ConstantPart(6, 0b100000), VariablePart(4),
+                   ConstantPart(3, 0b101), VariablePart(3)}),
+    OpcodeMatcher(SubtractImmediate, WordOnlyOffsets,
+                  {ConstantPart(7, 0b0010110), VariablePart(1)}),
+
 }; // namespace
 
 bool FindOperation(u16 opcode, u8 byteLength, const OpcodeMatcher **output) {
